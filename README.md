@@ -157,3 +157,108 @@ MouseBattery.exe --iconsheet    # 导出各电量档位图标放大图 icon-prev
 用 C# / .NET 8 WinForms 编写。提供两个构建产物：便携版零依赖、单文件，精简版依赖机器上的 .NET 8 Desktop Runtime，详见上面的「发给别人使用」。
 
 提醒没用系统的 `NotifyIcon.ShowBalloonTip`：Windows 11 要求程序向通知中心注册 AppUserModelID，未注册的裸 exe 调用会被静默丢弃（实测通知数据库无任何写入）。因此改为自绘的右下角卡片，任何环境下都保证可见，也能顺带把电池图形和告警配色画出来。
+
+## 源码与二次开发
+
+### 项目结构
+
+| 文件 | 职责 |
+|---|---|
+| `Program.cs` | 入口、单实例互斥、DPI 初始化；`--dump` 等诊断模式的实现 |
+| `TrayContext.cs` | 托盘图标、右键菜单、轮询调度、低电量判定、开机自启 |
+| `BatteryMonitor.cs` | 采集层：GATT 连接与 Notify 订阅、系统属性兜底、两路数据合并 |
+| `DevProp.cs` | SetupAPI P/Invoke，枚举 BLE 设备并读取 `DEVPKEY_Bluetooth_Battery` |
+| `BatteryIcon.cs` | 托盘电池图标的矢量绘制；电量分档取色（`ColorFor`） |
+| `DeviceIcons.cs` | 设备类型图标（鼠标/键盘/耳机/通用）绘制与类型识别 |
+| `PopupNotice.cs` | 右下角低电量提醒卡片（自绘，替代系统气泡） |
+| `SettingsForm.cs` | 设置窗口，所有布局按 96 DPI 基准手写缩放 |
+| `AppSettings.cs` | `settings.json` 读写、路径回退、参数归一化 |
+| `build.cmd` | 一键产出精简版与便携版 |
+
+依赖只有 .NET SDK 自带的 WinForms 与 WinRT（`net8.0-windows10.0.19041.0` 目标框架直接提供），**没有任何 NuGet 第三方包**。
+
+### 换一台电脑继续开发
+
+**第一步：装 .NET 8 SDK**
+
+注意是 **SDK**，不是 Runtime。
+
+```
+https://dotnet.microsoft.com/download/dotnet/8.0
+```
+
+装完在命令行确认：
+
+```
+dotnet --list-sdks
+```
+
+应该能看到 `8.0.x`。只要有 SDK，Runtime 会被一并安装。
+
+**第二步：把源码放过去，任选一种**
+
+| 方式 | 做法 |
+|---|---|
+| 源码压缩包 | 解压 `MouseBattery-src-v1.2.1.zip`，得到上表那 15 个文件 |
+| Git 仓库（推荐） | 见下一节，`git clone <你的仓库地址>` |
+| U 盘直接拷 | 拷整个 `MouseBattery` 文件夹，但**必须删掉 `bin`、`obj`、`dist`、`dist-portable`**，它们是本机编译产物，换机器没用还可能引起还原失败 |
+
+**第三步：构建并验证**
+
+双击 `build.cmd`，或者：
+
+```
+dotnet build -c Release
+```
+
+编完跑一下诊断命令确认能读到设备：
+
+```
+MouseBattery.exe --dump
+```
+
+它会在同目录生成 `dump.txt`，里面有设备名、类型、电量、数据来源。能读到设备就说明环境齐了。
+
+**第四步：开工**
+
+用 Visual Studio 2022 / VS Code / Rider 打开 `MouseBattery.csproj` 都能直接编辑调试。日常改完代码，`build.cmd` 出两个版本。
+
+### 上传到 GitHub
+
+仓库已经在本地初始化好了（`git init`，分支 `main`，首次提交完成），只差一个远端地址。
+
+**方式 A：网页建仓 + 命令行推送**
+
+1. 打开 https://github.com/new
+2. 填仓库名（如 `bluetooth-battery-tray`），选 **Private**（如果不想公开），**不要**勾选 "Add a README" 之类的初始化项
+3. 创建后复制它给出的仓库地址，然后在 `MouseBattery` 目录执行：
+
+```bash
+git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+git push -u origin main
+```
+
+推送时会要求认证。GitHub 已不支持账号密码，需要用 **Personal Access Token**（Settings → Developer settings → Personal access tokens → 勾 `repo` 权限）当密码；或者装 GitHub CLI 后 `gh auth login` 走浏览器授权。
+
+**方式 B：用 GitHub CLI 一步到位**
+
+装好 `gh` 并 `gh auth login` 之后：
+
+```bash
+gh repo create bluetooth-battery-tray --private --source=. --remote=origin --push
+```
+
+一条命令建仓、关联、推送全做完。
+
+### 哪些东西不进仓库
+
+`.gitignore` 已把这些排除，都是本机相关的：
+
+- `bin/`、`obj/`、`dist/`、`dist-portable/` —— 编译产物
+- `settings.json` —— 存着你自己鼠标的 MAC 和偏好设置
+- `*.log` —— 运行日志
+- `dump.txt`、`icon-preview.png`、`shot.png`、`settings-shot.png` —— 诊断命令的产物
+
+`.gitattributes` 里固定了换行符：`.cmd`/`.bat` 强制 CRLF，否则批处理在别的机器上被 checkout 成 LF 可能执行异常。
+
+克隆到新机器后，第一次运行会自动生成属于那台机器的 `settings.json`，不需要也不应该从旧机器带过来。
