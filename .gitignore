@@ -1,0 +1,22 @@
+# ---- 构建产物 ----
+bin/
+obj/
+dist/
+dist-portable/
+
+# ---- 本地配置与运行日志 ----
+# settings.json 里存着本机的设备 MAC 与个人偏好，不应入库
+settings.json
+*.log
+
+# ---- 诊断命令产生的文件 ----
+dump.txt
+icon-preview.png
+shot.png
+settings-shot.png
+
+# ---- IDE / 编辑器 ----
+.vs/
+.idea/
+*.user
+*.suo

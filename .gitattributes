@@ -1,0 +1,14 @@
+# Windows 项目：默认 CRLF 检出，避免 .cmd 在别的机器上被转成 LF 后执行异常
+* text=auto eol=crlf
+
+# 批处理必须是 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Markdown 用 LF，跨平台编辑器体验更好
+*.md text eol=lf
+
+# 二进制
+*.png binary
+*.ico binary
+*.exe binary
