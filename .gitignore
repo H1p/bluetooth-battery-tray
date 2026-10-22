@@ -15,6 +15,9 @@ icon-preview.png
 shot.png
 settings-shot.png
 
+# ---- 本机专用脚本（含本机绝对路径，换机器无效）----
+git-push.cmd
+
 # ---- IDE / 编辑器 ----
 .vs/
 .idea/
