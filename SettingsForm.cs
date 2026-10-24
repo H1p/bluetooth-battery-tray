@@ -1,3 +1,4 @@
+using System.Drawing.Drawing2D;
 using System.Media;
 
 namespace MouseBattery;
@@ -11,11 +12,18 @@ namespace MouseBattery;
 internal sealed class SettingsForm : Form
 {
     private const int MaxSeconds = 12 * 60 * 60;
+    private const int MaxDeviceRows = 4;
 
     private readonly AppSettings _settings;
-    private readonly BatteryReading _reading;
     private readonly Action<string, string>? _previewNotify;
+    private readonly Func<Task<IReadOnlyList<BatteryReading>>>? _refresh;
     private readonly float _scale;
+
+    private IReadOnlyList<BatteryReading> _readings;
+    private readonly GroupBox _deviceBox;
+    private readonly Panel _rowHost;
+    private readonly Button _btnRefresh;
+    private readonly int _rowCapacity;
 
     private readonly NumericUpDown _threshold;
     private readonly NumericUpDown _redBelow;
@@ -29,15 +37,30 @@ internal sealed class SettingsForm : Form
 
     private int _unitSeconds = 1;
     private bool _suspendUnitEvent;
+    private readonly List<(BatteryReading Reading, Label Label)> _nameLabels = new();
 
-    public SettingsForm(AppSettings settings, BatteryReading reading, Action<string, string>? previewNotify = null)
+    public SettingsForm(
+        AppSettings settings,
+        IReadOnlyList<BatteryReading> readings,
+        Action<string, string>? previewNotify = null,
+        Func<Task<IReadOnlyList<BatteryReading>>>? refresh = null)
     {
         _settings = settings;
-        _reading = reading;
+        _readings = readings;
         _previewNotify = previewNotify;
+        _refresh = refresh;
         _scale = GetDpiScale();
 
-        Text = "蓝牙鼠标电量 · 设置";
+        int rows = Math.Clamp(readings.Count, 1, MaxDeviceRows);
+        _rowCapacity = rows;
+        int infoH = S(30) + rows * S(26) + S(32);
+
+        int infoY = S(12);
+        int alertY = infoY + infoH + S(8);
+        int pollY = alertY + S(182) + S(8);
+        int btnY = pollY + S(96) + S(12);
+
+        Text = "设备电量 · 设置";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -45,73 +68,64 @@ internal sealed class SettingsForm : Form
         AutoScaleMode = AutoScaleMode.None;
         Font = new Font("Microsoft YaHei UI", 9f);
         BackColor = Color.FromArgb(250, 250, 250);
-        ClientSize = new Size(S(420), S(466));
+        ClientSize = new Size(S(420), btnY + S(30) + S(8));
 
-        // ---- 当前设备
-        var infoBox = new GroupBox
+        // ---- 设备列表
+        _deviceBox = new GroupBox
         {
-            Text = "当前设备",
-            Location = new Point(S(16), S(12)),
-            Size = new Size(S(388), S(110)),
+            Text = readings.Count > 0 ? $"已识别设备（{readings.Count}）" : "当前设备",
+            Location = new Point(S(16), infoY),
+            Size = new Size(S(388), infoH),
             BackColor = Color.White,
         };
 
-        var iconBox = new PictureBox
+        // 主动刷新：不用等轮询周期，也不用手动重开窗口
+        _btnRefresh = new Button
         {
-            Location = new Point(S(16), S(30)),
-            Size = new Size(S(38), S(38)),
-            SizeMode = PictureBoxSizeMode.Zoom,
-            Image = DeviceIcons.Render(
-                reading.Kind,
-                S(38),
-                BatteryIcon.ColorFor(reading.Percent, reading.Connected)),
+            Text = "刷新",
+            Location = new Point(S(296), S(5)),
+            Size = new Size(S(76), S(22)),
+            FlatStyle = FlatStyle.System,
+            Font = new Font("Microsoft YaHei UI", 8.5f),
+        };
+        _btnRefresh.Click += async (_, _) => await RefreshDeviceRowsAsync();
+
+        _rowHost = new Panel
+        {
+            Location = new Point(S(1), S(28)),
+            Size = new Size(S(386), rows * S(26)),
             BackColor = Color.Transparent,
         };
 
-        var lblName = new Label
-        {
-            Text = string.IsNullOrEmpty(_reading.DeviceName) ? "尚未读取到设备" : _reading.DeviceName,
-            Location = new Point(S(64), S(24)),
-            Size = new Size(S(310), S(22)),
-            Font = new Font("Microsoft YaHei UI", 9.8f, FontStyle.Bold),
-        };
-
-        string addrText = string.IsNullOrEmpty(_reading.Address) ? "—" : _reading.Address;
-        var lblInfo = new Label
-        {
-            Text = $"{DeviceIcons.Describe(_reading.Kind)}　·　{addrText}",
-            Location = new Point(S(64), S(48)),
-            Size = new Size(S(310), S(19)),
-            ForeColor = Color.FromArgb(92, 92, 92),
-            Font = new Font("Microsoft YaHei UI", 8.5f),
-        };
-
-        string percentText = _reading.Percent is int p ? $"{p}%" : "未知";
-        var lblSub = new Label
-        {
-            Text = $"电量 {percentText}　·　来源 {_reading.Source}",
-            Location = new Point(S(64), S(68)),
-            Size = new Size(S(310), S(19)),
-            ForeColor = Color.FromArgb(92, 92, 92),
-            Font = new Font("Microsoft YaHei UI", 8.5f),
-        };
+        int footerY = S(30) + rows * S(26);
 
         var lblCaveat = new Label
         {
-            Text = "刷新速度由设备固件决定，软件只保证第一时间收到上报。",
-            Location = new Point(S(16), S(92)),
-            Size = new Size(S(360), S(16)),
+            Text = "刷新速度由设备固件决定",
+            Location = new Point(S(15), footerY + S(5)),
+            Size = new Size(S(210), S(16)),
             ForeColor = Color.FromArgb(140, 140, 140),
             Font = new Font("Microsoft YaHei UI", 7.5f),
         };
 
-        infoBox.Controls.AddRange(new Control[] { iconBox, lblName, lblInfo, lblSub, lblCaveat });
+        var btnEditNames = new Button
+        {
+            Text = "编辑设备名称…",
+            Location = new Point(S(236), footerY),
+            Size = new Size(S(136), S(24)),
+            FlatStyle = FlatStyle.System,
+            Font = new Font("Microsoft YaHei UI", 8.5f),
+        };
+        btnEditNames.Click += (_, _) => EditDeviceNames();
+
+        _deviceBox.Controls.AddRange(new Control[] { _btnRefresh, _rowHost, lblCaveat, btnEditNames });
+        BuildDeviceRows(readings);
 
         // ---- 提醒
         var alertBox = new GroupBox
         {
             Text = "提醒与配色",
-            Location = new Point(S(16), S(130)),
+            Location = new Point(S(16), alertY),
             Size = new Size(S(388), S(182)),
             BackColor = Color.White,
         };
@@ -239,7 +253,7 @@ internal sealed class SettingsForm : Form
         var pollBox = new GroupBox
         {
             Text = "采集",
-            Location = new Point(S(16), S(320)),
+            Location = new Point(S(16), pollY),
             Size = new Size(S(388), S(96)),
             BackColor = Color.White,
         };
@@ -305,7 +319,7 @@ internal sealed class SettingsForm : Form
         _autoStart = new CheckBox
         {
             Text = "开机自动启动",
-            Location = new Point(S(20), S(432)),
+            Location = new Point(S(20), btnY + S(4)),
             Size = new Size(S(170), S(24)),
             Checked = Startup.IsEnabled(),
         };
@@ -313,7 +327,7 @@ internal sealed class SettingsForm : Form
         var btnOk = new Button
         {
             Text = "确定",
-            Location = new Point(S(232), S(428)),
+            Location = new Point(S(232), btnY),
             Size = new Size(S(84), S(30)),
             DialogResult = DialogResult.OK,
         };
@@ -321,7 +335,7 @@ internal sealed class SettingsForm : Form
         var btnCancel = new Button
         {
             Text = "取消",
-            Location = new Point(S(322), S(428)),
+            Location = new Point(S(322), btnY),
             Size = new Size(S(84), S(30)),
             DialogResult = DialogResult.Cancel,
         };
@@ -333,8 +347,147 @@ internal sealed class SettingsForm : Form
 
         Controls.AddRange(new Control[]
         {
-            infoBox, alertBox, pollBox, _autoStart, btnOk, btnCancel,
+            _deviceBox, alertBox, pollBox, _autoStart, btnOk, btnCancel,
         });
+    }
+
+    /// <summary>重建设备行。刷新后设备数量可能变化，所以整块重建而不是逐个改文本。</summary>
+    private void BuildDeviceRows(IReadOnlyList<BatteryReading> readings)
+    {
+        _rowHost.SuspendLayout();
+        try
+        {
+            _rowHost.Controls.Clear();
+            _nameLabels.Clear();
+
+            if (readings.Count == 0)
+            {
+                _rowHost.Controls.Add(new Label
+                {
+                    Text = "尚未读取到设备",
+                    Location = new Point(S(15), S(2)),
+                    Size = new Size(S(340), S(22)),
+                    ForeColor = Color.FromArgb(120, 120, 120),
+                });
+            }
+            else
+            {
+                for (int i = 0; i < _rowCapacity; i++)
+                {
+                    int rowY = i * S(26);
+
+                    // 设备比预留行多时，最后一行改成"还有 N 台"
+                    if (readings.Count > _rowCapacity && i == _rowCapacity - 1)
+                    {
+                        _rowHost.Controls.Add(new Label
+                        {
+                            Text = $"…等共 {readings.Count} 台设备",
+                            Location = new Point(S(41), rowY),
+                            Size = new Size(S(330), S(22)),
+                            ForeColor = Color.FromArgb(120, 120, 120),
+                        });
+                        break;
+                    }
+
+                    BatteryReading r = readings[i];
+                    Color color = BatteryIcon.ColorFor(r.Percent, r.Connected);
+
+                    // 图标画在更大的画布上，右上角留出角标的位置
+                    const int iconSize = 18;
+                    const int padTop = 6;
+                    const int padRight = 12;
+
+                    using (Bitmap glyph = DeviceIcons.Render(r.Kind, S(iconSize), color))
+                    {
+                        var canvas = new Bitmap(S(iconSize + padRight), S(iconSize + padTop));
+                        using (Graphics cg = Graphics.FromImage(canvas))
+                        {
+                            cg.SmoothingMode = SmoothingMode.AntiAlias;
+                            cg.Clear(Color.Transparent);
+                            cg.DrawImage(glyph, 0, S(padTop));
+                            DeviceIcons.DrawTransportBadge(
+                                cg,
+                                new RectangleF(0, S(padTop), S(iconSize), S(iconSize)),
+                                r.Transport,
+                                _scale);
+                        }
+
+                        var iconBox = new PictureBox
+                        {
+                            Location = new Point(S(15), rowY + S(2) - S(padTop)),
+                            Size = canvas.Size,
+                            SizeMode = PictureBoxSizeMode.Normal,
+                            Image = canvas,
+                            BackColor = Color.Transparent,
+                        };
+                        _rowHost.Controls.Add(iconBox);
+                    }
+
+                    var lblName = new Label
+                    {
+                        Text = string.IsNullOrEmpty(r.DeviceName) ? "未知设备" : r.DeviceName,
+                        Location = new Point(S(41), rowY),
+                        Size = new Size(S(168), S(22)),
+                        Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold),
+                        AutoEllipsis = true,
+                        TextAlign = ContentAlignment.MiddleLeft,
+                    };
+
+                    // 最新更新时间：贴在百分比左边，灰色小字，不抢主信息
+                    var lblStamp = new Label
+                    {
+                        Text = TrayContext.Ago(r.Stamp),
+                        Location = new Point(S(211), rowY),
+                        Size = new Size(S(78), S(22)),
+                        ForeColor = Color.FromArgb(150, 150, 150),
+                        Font = new Font("Microsoft YaHei UI", 7.8f),
+                        TextAlign = ContentAlignment.MiddleRight,
+                    };
+
+                    var lblRowPercent = new Label
+                    {
+                        Text = r.Percent is int p ? $"{p}%" : "未知",
+                        Location = new Point(S(291), rowY),
+                        Size = new Size(S(80), S(22)),
+                        ForeColor = color,
+                        Font = new Font("Microsoft YaHei UI", 9.4f, FontStyle.Bold),
+                        TextAlign = ContentAlignment.MiddleRight,
+                    };
+
+                    _rowHost.Controls.AddRange(new Control[] { lblName, lblStamp, lblRowPercent });
+                    _nameLabels.Add((r, lblName));
+                }
+            }
+
+            _deviceBox.Text = readings.Count > 0 ? $"已识别设备（{readings.Count}）" : "当前设备";
+        }
+        finally
+        {
+            _rowHost.ResumeLayout();
+        }
+    }
+
+    private async Task RefreshDeviceRowsAsync()
+    {
+        if (_refresh == null) return;
+
+        _btnRefresh.Enabled = false;
+        _btnRefresh.Text = "刷新中…";
+        try
+        {
+            IReadOnlyList<BatteryReading> fresh = await _refresh();
+            _readings = fresh;
+            BuildDeviceRows(fresh);
+        }
+        catch
+        {
+            // 刷新失败保留原有列表，不弹窗打断
+        }
+        finally
+        {
+            _btnRefresh.Text = "刷新";
+            _btnRefresh.Enabled = true;
+        }
     }
 
     private int S(int baseValue) => (int)Math.Round(baseValue * _scale);
@@ -424,12 +577,36 @@ internal sealed class SettingsForm : Form
         Startup.Set(_autoStart.Checked);
     }
 
-    private void ShowTestNotification()
+    private void EditDeviceNames()
     {
-        string kindText = DeviceIcons.Describe(_reading.Kind);
+        using var form = new DeviceNameForm(_settings, _readings);
+        if (form.ShowDialog(this) != DialogResult.OK) return;
+
+        foreach ((BatteryReading reading, Label label) in _nameLabels)
+        {
+            string name = DisplayNameOf(reading);
+            label.Text = string.IsNullOrEmpty(name) ? "未知设备" : name;
+        }
+    }
+
+    /// <summary>有别名用别名，否则用设备原名。</summary>
+    private string DisplayNameOf(BatteryReading reading)
+    {
+        string mac = (reading.Address ?? string.Empty).Replace(":", string.Empty).Trim().ToLowerInvariant();
+        if (_settings.DeviceAliases.TryGetValue(mac, out string? alias) && !string.IsNullOrWhiteSpace(alias))
+        {
+            return alias.Trim();
+        }
+        return string.IsNullOrEmpty(reading.OriginalName) ? reading.DeviceName : reading.OriginalName;
+    }
+
+    private void ShowTestNotification()
+    {        BatteryReading? first = _readings.FirstOrDefault();
+        DeviceKind kind = first?.Kind ?? DeviceKind.Mouse;
+        string kindText = DeviceIcons.Describe(kind);
         string title = $"{kindText}电量仅剩（测试）";
-        string body = _reading.Percent is int p
-            ? $"{_reading.DeviceName} 电量 {p}%，低于 {_threshold.Value}% 时会这样提醒你。"
+        string body = first?.Percent is int p
+            ? $"{first.DeviceName} 电量 {p}%，低于 {_threshold.Value}% 时会这样提醒你。"
             : $"设备电量低于 {_threshold.Value}% 时会这样提醒你。";
 
         if (_previewNotify != null)
@@ -439,6 +616,6 @@ internal sealed class SettingsForm : Form
             return;
         }
 
-        PopupNotice.Show(title, body, _reading.Percent, _sound.Checked, _reading.Kind);
+        PopupNotice.Show(title, body, first?.Percent, _sound.Checked, kind);
     }
 }

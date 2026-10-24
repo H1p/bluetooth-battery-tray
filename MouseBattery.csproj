@@ -11,10 +11,10 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>MouseBattery</AssemblyName>
     <RootNamespace>MouseBattery</RootNamespace>
-    <Product>蓝牙鼠标电量</Product>
-    <AssemblyTitle>蓝牙鼠标电量</AssemblyTitle>
-    <Version>1.2.1</Version>
-    <FileVersion>1.2.1</FileVersion>
+    <Product>设备电量</Product>
+    <AssemblyTitle>设备电量</AssemblyTitle>
+    <Version>1.6.0</Version>
+    <FileVersion>1.6.0</FileVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>

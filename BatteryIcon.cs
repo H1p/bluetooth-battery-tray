@@ -5,7 +5,10 @@ using System.Runtime.InteropServices;
 
 namespace MouseBattery;
 
-/// <summary>把电量画成 16px 托盘图标里能看清的电池形状。</summary>
+/// <summary>
+/// 托盘图标：上半部是设备轮廓（鼠标/键盘/耳机/手柄/通用），下半部是电量条。
+/// 多设备同屏时，光靠电池形状分不清是哪一台，所以把设备类型直接画进图标里。
+/// </summary>
 internal static class BatteryIcon
 {
     [DllImport("user32.dll", SetLastError = true)]
@@ -31,7 +34,7 @@ internal static class BatteryIcon
         return Color.FromArgb(46, 168, 74);
     }
 
-    public static Icon Create(int? percent, bool connected)
+    public static Icon Create(DeviceKind kind, int? percent, bool connected)
     {
         const int size = 32;
         using var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
@@ -43,49 +46,40 @@ internal static class BatteryIcon
 
             Color color = ColorFor(percent, connected);
 
-            // 电池：外壳 19×14，右侧一个小正极凸起，整体在 32px 画布里略微内缩
-            var bodyRect = new RectangleF(4f, 9f, 19f, 14f);
-            var capRect = new RectangleF(23.4f, 12.6f, 3.8f, 6.8f);
+            // 设备轮廓：上 21.5px，水平居中。DeviceIcons 内部按 24×24 设计，会等比缩放
+            const float glyphSize = 21.5f;
+            var glyphRect = new RectangleF((size - glyphSize) / 2f, 0.4f, glyphSize, glyphSize);
+            DeviceIcons.Draw(g, kind, glyphRect, color);
 
-            using (var shell = new GraphicsPath())
+            // 底部电量条：外框 + 按比例填充。16px 缩放下只有 3px 高，所以画得比常规粗一些
+            var track = new RectangleF(2.6f, 24.6f, 26.8f, 6f);
+            using (GraphicsPath trackPath = RoundedRect(track, 3f))
+            using (var pen = new Pen(color, 1.35f) { LineJoin = LineJoin.Round })
             {
-                AddRoundedRect(shell, bodyRect, 2.6f);
-                using var pen = new Pen(color, 1.8f) { LineJoin = LineJoin.Round };
-                g.DrawPath(pen, shell);
+                g.DrawPath(pen, trackPath);
             }
 
-            using (var capBrush = new SolidBrush(color))
-            {
-                g.FillRectangle(capBrush, capRect);
-            }
-
-            // 内部填充：随电量增减，四周留出空隙不压住边框
             if (percent is int p && p > 0)
             {
-                const float innerX = 7.2f;
-                const float innerMaxW = 12.6f;
-                const float innerY = 11.6f;
-                const float innerH = 8.8f;
-
-                float w = innerMaxW * Math.Clamp(p, 0, 100) / 100f;
+                float innerW = track.Width - 3f;
+                float w = innerW * Math.Clamp(p, 0, 100) / 100f;
                 if (w < 2f) w = 2f;
 
+                var fillRect = new RectangleF(track.X + 1.5f, track.Y + 1.5f, w, track.Height - 3f);
+                using GraphicsPath fillPath = RoundedRect(fillRect, 1.5f);
                 using var fill = new SolidBrush(color);
-                var fillRect = new RectangleF(innerX, innerY, w, innerH);
-                using var fillPath = new GraphicsPath();
-                AddRoundedRect(fillPath, fillRect, 1.1f);
                 g.FillPath(fill, fillPath);
             }
 
             if (!connected)
             {
-                // 断开：画一道斜杠，一眼看出没连上
+                // 断开：一道斜杠压在设备轮廓上，一眼看出没连上
                 using var slash = new Pen(Color.FromArgb(216, 58, 44), 2.4f)
                 {
                     StartCap = LineCap.Round,
                     EndCap = LineCap.Round,
                 };
-                g.DrawLine(slash, 7.5f, 22f, 20.5f, 9.5f);
+                g.DrawLine(slash, 8f, 21f, 24f, 5.5f);
             }
         }
 
@@ -106,8 +100,9 @@ internal static class BatteryIcon
         }
     }
 
-    private static void AddRoundedRect(GraphicsPath path, RectangleF rect, float radius)
+    private static GraphicsPath RoundedRect(RectangleF rect, float radius)
     {
+        var path = new GraphicsPath();
         float d = radius * 2f;
         if (d > rect.Width) d = rect.Width;
         if (d > rect.Height) d = rect.Height;
@@ -117,5 +112,6 @@ internal static class BatteryIcon
         path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0f, 90f);
         path.AddArc(rect.X, rect.Bottom - d, d, d, 90f, 90f);
         path.CloseFigure();
+        return path;
     }
 }

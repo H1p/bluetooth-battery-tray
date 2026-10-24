@@ -1,4 +1,3 @@
-using System.Media;
 using System.Text;
 
 namespace MouseBattery;
@@ -69,19 +68,7 @@ internal static class Program
             }
 
             var settings = AppSettings.Load();
-            var reading = new BatteryReading
-            {
-                Percent = previewPercent,
-                DeviceName = "示例蓝牙鼠标",
-                Address = "AA:BB:CC:DD:EE:FF",
-                Source = "GATT 实时订阅",
-                Connected = true,
-                Subscribed = true,
-                Stamp = DateTime.Now.AddMinutes(-2),
-                Kind = DeviceKind.Mouse,
-            };
-
-            var form = new SettingsForm(settings, reading, null);
+            var form = new SettingsForm(settings, SampleReadings(previewPercent), null);
             var timer = new System.Windows.Forms.Timer { Interval = 1400 };
             timer.Tick += (_, _) =>
             {
@@ -95,12 +82,74 @@ internal static class Program
             return 0;
         }
 
+        // 诊断模式：单独渲染悬停卡片并截图，用来核对多设备列表的排版
+        if (args.Any(a => a.Equals("--hover-preview", StringComparison.OrdinalIgnoreCase)))
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            // 模拟光标停在托盘图标上。任务栏可能在顶部也可能在底部，按工作区的缺口判断
+            Screen screen = Screen.PrimaryScreen ?? Screen.AllScreens[0];
+            Rectangle bounds = screen.Bounds;
+            Rectangle work = screen.WorkingArea;
+
+            int trayY = work.Top > bounds.Top ? bounds.Top + 20 : bounds.Bottom - 20;
+            var trayPoint = new Point(bounds.Right - 20, trayY);
+
+            HoverCard card = HoverCard.CreateForPreview(SampleReadings(100), trayPoint);
+            var timer = new System.Windows.Forms.Timer { Interval = 1200 };
+            timer.Tick += (_, _) =>
+            {
+                timer.Stop();
+                CaptureForm(card, "hover-preview.png");
+                try
+                {
+                    File.WriteAllText(
+                        Path.Combine(AppContext.BaseDirectory, "hover-preview.txt"),
+                        $"模拟光标: {trayPoint}\n" +
+                        $"卡片矩形: {card.Bounds}\n" +
+                        $"屏幕上: {screen.Bounds}  工作区: {screen.WorkingArea}\n" +
+                        $"光标是否落在卡片内: {card.Bounds.Contains(trayPoint)}\n");
+                }
+                catch
+                {
+                    // 诊断文件写不了不影响截图
+                }
+                card.Close();
+            };
+            card.Shown += (_, _) => timer.Start();
+
+            Application.Run(card);
+            return 0;
+        }
+
+        // 诊断模式：单独渲染"编辑设备名称"对话框并截图
+        if (args.Any(a => a.Equals("--rename-preview", StringComparison.OrdinalIgnoreCase)))
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            var settings = AppSettings.Load();
+            var form = new DeviceNameForm(settings, SampleReadings(100));
+            var timer = new System.Windows.Forms.Timer { Interval = 1200 };
+            timer.Tick += (_, _) =>
+            {
+                timer.Stop();
+                CaptureForm(form, "rename-preview.png");
+                form.Close();
+            };
+            form.Shown += (_, _) => timer.Start();
+
+            Application.Run(form);
+            return 0;
+        }
+
         using var mutex = new Mutex(true, MutexName, out bool isFirst);
         if (!isFirst)
         {
             MessageBox.Show(
-                "蓝牙鼠标电量已经在运行了，请查看任务栏右下角的托盘图标。",
-                "蓝牙鼠标电量",
+                "设备电量已经在运行了，请查看任务栏右下角的托盘图标。",
+                "设备电量",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return 0;
@@ -149,17 +198,23 @@ internal static class Program
         using (var monitor = new BatteryMonitor(settings))
         {
             sb.AppendLine();
-            BatteryReading reading = await monitor.PollAsync(true);
-            sb.AppendLine("--- 合并结果 ---");
-            sb.AppendLine($"  设备: {reading.DeviceName}");
-            sb.AppendLine($"  地址: {reading.Address}");
-            sb.AppendLine($"  类型: {DeviceIcons.Describe(reading.Kind)}");
-            sb.AppendLine($"  电量: {(reading.Percent is int p ? p + "%" : "未知")}");
-            sb.AppendLine($"  来源: {reading.Source}");
-            sb.AppendLine($"  订阅: {reading.Subscribed}");
-            sb.AppendLine($"  连接: {reading.Connected}");
-            sb.AppendLine($"  采集: {reading.Stamp:yyyy-MM-dd HH:mm:ss}");
-            if (reading.Error != null) sb.AppendLine($"  说明: {reading.Error}");
+            List<BatteryReading> readings = await monitor.PollAllAsync(true);
+            sb.AppendLine($"--- 合并结果（{readings.Count} 台）---");
+            if (readings.Count == 0) sb.AppendLine("  没有带电量属性的蓝牙设备");
+
+            foreach (BatteryReading reading in readings)
+            {
+                string aliasNote = string.Equals(reading.DeviceName, reading.OriginalName, StringComparison.Ordinal)
+                    ? string.Empty
+                    : $"（原名 {reading.OriginalName}）";
+                sb.AppendLine($"  [{reading.DeviceName}]{aliasNote} 类型={DeviceIcons.Describe(reading.Kind)}");
+                sb.AppendLine($"      地址: {reading.Address}");
+                sb.AppendLine($"      电量: {(reading.Percent is int p ? p + "%" : "未知")}");
+                sb.AppendLine($"      来源: {reading.Source}");
+                sb.AppendLine($"      订阅: {reading.Subscribed}  连接: {reading.Connected}");
+                sb.AppendLine($"      采集: {reading.Stamp:yyyy-MM-dd HH:mm:ss}");
+                if (reading.Error != null) sb.AppendLine($"      说明: {reading.Error}");
+            }
         }
 
         string text = sb.ToString();
@@ -191,7 +246,8 @@ internal static class Program
 
         const int cell = 152;
         const int pad = 12;
-        int width = cases.Length * cell + pad * 2;
+        int columns = Math.Max(cases.Length, 5);
+        int width = columns * cell + pad * 2;
         int height = cell + 40 + 200;
 
         using var sheet = new Bitmap(width, height);
@@ -212,7 +268,7 @@ internal static class Program
                 (int? percent, bool connected, string label) = cases[i];
                 int x = pad + i * cell;
 
-                using Icon icon = BatteryIcon.Create(percent, connected);
+                using Icon icon = BatteryIcon.Create(DeviceKind.Mouse, percent, connected);
 
                 // 左：16×16 真实托盘尺寸，放大 5 倍，深色底模拟任务栏
                 using (var tiny = new Bitmap(16, 16))
@@ -240,10 +296,11 @@ internal static class Program
             int devTop = cell + 50;
             var kinds = new (DeviceKind Kind, string Label)[]
             {
-                (DeviceKind.Mouse, "鼠标"),
-                (DeviceKind.Keyboard, "键盘"),
-                (DeviceKind.Headset, "耳机"),
-                (DeviceKind.Generic, "通用"),
+                (DeviceKind.Mouse, "鼠标 62%"),
+                (DeviceKind.Keyboard, "键盘 62%"),
+                (DeviceKind.Headset, "耳机 62%"),
+                (DeviceKind.Gamepad, "手柄 62%"),
+                (DeviceKind.Generic, "通用 62%"),
             };
 
             using var ink = new SolidBrush(Color.FromArgb(40, 40, 40));
@@ -251,18 +308,21 @@ internal static class Program
             {
                 int x = pad + i * cell;
 
-                using (Bitmap small = DeviceIcons.Render(kinds[i].Kind, 16, Color.FromArgb(40, 40, 40)))
+                using Icon icon = BatteryIcon.Create(kinds[i].Kind, 62, true);
+
+                // 左：16×16 真实托盘尺寸，放大 5 倍，深色底模拟任务栏
                 using (var tiny = new Bitmap(16, 16))
                 {
                     using (Graphics tg = Graphics.FromImage(tiny))
                     {
-                        tg.Clear(Color.FromArgb(246, 246, 246));
-                        tg.DrawImage(small, 0, 0);
+                        tg.Clear(Color.FromArgb(28, 28, 28));
+                        tg.DrawIcon(icon, new Rectangle(0, 0, 16, 16));
                     }
                     g.DrawImage(tiny, new Rectangle(x + 8, devTop, 80, 80));
                 }
 
-                using (Bitmap big = DeviceIcons.Render(kinds[i].Kind, 60, Color.FromArgb(40, 40, 40)))
+                // 右：32×32 原始绘制，放大看细节
+                using (Bitmap big = icon.ToBitmap())
                 {
                     g.DrawImage(big, new Rectangle(x + 96, devTop + 10, 60, 60));
                 }
@@ -313,6 +373,50 @@ internal static class Program
         return 0;
     }
 
+    /// <summary>诊断截图用的样例数据：三种设备各一台。</summary>
+    /// <summary>预览/截图模式用的示例数据，全部是虚构的，不要写真实设备。</summary>
+    private static List<BatteryReading> SampleReadings(int mousePercent)
+    {
+        return new List<BatteryReading>
+        {
+            new()
+            {
+                Percent = mousePercent,
+                DeviceName = "示例鼠标",
+                OriginalName = "Sample Mouse",
+                Address = "02:00:00:00:00:01",
+                Source = "GATT 实时订阅",
+                Connected = true,
+                Subscribed = true,
+                Stamp = DateTime.Now.AddMinutes(-2),
+                Kind = DeviceKind.Mouse,
+            },
+            new()
+            {
+                Percent = 56,
+                DeviceName = "示例键盘",
+                OriginalName = "Sample Keyboard",
+                Address = "02:00:00:00:00:02",
+                Source = "2.4G 私有协议",
+                Connected = true,
+                Stamp = DateTime.Now.AddSeconds(-20),
+                Kind = DeviceKind.Keyboard,
+                Transport = Transport.Wireless24G,
+            },
+            new()
+            {
+                Percent = 18,
+                DeviceName = "示例耳机",
+                OriginalName = "Sample Headset",
+                Address = "02:00:00:00:00:03",
+                Source = "系统属性",
+                Connected = true,
+                Stamp = DateTime.Now.AddHours(-1),
+                Kind = DeviceKind.Headset,
+            },
+        };
+    }
+
     private static void CaptureForm(Form form, string fileName)
     {
         try
@@ -353,7 +457,7 @@ internal sealed class NotifyProbeContext : ApplicationContext
     {
         _icon = new NotifyIcon
         {
-            Icon = BatteryIcon.Create(18, true),
+            Icon = BatteryIcon.Create(DeviceKind.Mouse, 18, true),
             Text = "鼠标电量仅剩 18%",
             Visible = true,
         };
