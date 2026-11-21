@@ -1,4 +1,6 @@
+using System.Text.RegularExpressions;
 using Windows.Devices.Bluetooth;
+using Windows.Devices.Enumeration;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Foundation;
 using Windows.Storage.Streams;
@@ -24,6 +26,8 @@ internal sealed class BatteryReading
     public string Source { get; init; } = "-";
     public bool Connected { get; init; }
     public bool Subscribed { get; init; }
+    /// <summary>设备是否在上报充电中。只有 2.4G 协议能读到，其它通道一律 false。</summary>
+    public bool Charging { get; init; }
     public DeviceKind Kind { get; init; } = DeviceKind.Generic;
     public Transport Transport { get; init; } = Transport.Bluetooth;
     public string? Error { get; init; }
@@ -66,6 +70,9 @@ internal sealed class BatteryMonitor : IDisposable
     {
         _settings = settings;
         _ui = SynchronizationContext.Current;
+
+        // 先恢复上次的 2.4G 读数：开机自启时键盘往往还在休眠，读不到新值
+        LoadWirelessCache();
     }
 
     /// <summary>某台设备的电量发生变化时触发（已切回 UI 线程）。</summary>
@@ -103,6 +110,10 @@ internal sealed class BatteryMonitor : IDisposable
 
         // 2.4G 接收器走私有 HID，和蓝牙是两条独立来源，这里合并成一份
         List<BatteryReading> list = results.ToList();
+
+        // 经典蓝牙（BR/EDR）不在 BLE 枚举里，电量要从 PnP 属性表补一条
+        await AppendClassicAsync(list);
+
         await Task.Run(() => MergeWireless(list));
 
         return list
@@ -111,9 +122,202 @@ internal sealed class BatteryMonitor : IDisposable
             .ToList();
     }
 
+    /// <summary>上一次经典蓝牙的读取台数，用来避免每轮都写同一条日志。</summary>
+    private int _classicCount = -1;
+
     /// <summary>
-    /// 把 2.4G 读数并进来。同一台设备（按类型判断）在两种连接方式下只保留一条：
-    /// 谁的数据更新用谁的电量，名字沿用已有的那条，避免切换模式时列表里出现两台。
+    /// 补上经典蓝牙设备。
+    /// 这类设备（耳机、音箱）没有 GATT 电池服务，电量以 PnP 属性形式挂在 HFP 网关节点上，
+    /// 读它不需要打开设备、不需要建立连接，属于零打扰的被动读取。
+    ///
+    /// 必须过滤连接状态：BTHENUM 设备树会把**所有配对过的设备永久保留**，
+    /// 不过滤就会把几个月前配对、早已关机的耳机当成在线设备列出来（还会拿它的旧电量去算最低值）。
+    /// 同一台设备如果 BLE 侧已经上报，以 BLE 为准（那边是实时值）。
+    /// </summary>
+    private async Task AppendClassicAsync(List<BatteryReading> list)
+    {
+        List<ClassicDevice> classic;
+        try
+        {
+            classic = DevProp.EnumClassicDevices();
+        }
+        catch (Exception ex)
+        {
+            Log($"[经典蓝牙] 枚举失败: {ex.GetType().Name} {ex.Message}");
+            return;
+        }
+
+        ClassicDevice[] candidates = classic.Where(d => d.Battery.HasValue).ToArray();
+        if (candidates.Length == 0) return;
+
+        // 一次问系统「现在有哪些经典蓝牙是连着的」，比逐台查 ConnectionStatus 可靠
+        HashSet<string> connected = await ConnectedClassicAsync();
+
+        var known = new HashSet<string>(list.Select(r => NormalizeAddress(r.Address)), StringComparer.OrdinalIgnoreCase);
+        int added = 0;
+
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            ClassicDevice device = candidates[i];
+
+            // 双重判据：系统说在线，或它刚刚上报过电量。
+            // 后者是兜底——个别音频设备的连接状态查不到，
+            // 但属性时间戳不会骗人：只有设备真的在连着，系统才会更新它。
+            bool fresh = device.Stamp is DateTime stamp && (DateTime.Now - stamp).TotalMinutes < 10;
+            bool online = connected.Contains(device.Address) || fresh;
+            if (!online) continue;
+
+            if (!string.IsNullOrEmpty(_settings.DeviceAddress)
+                && !string.Equals(device.Address, _settings.DeviceAddress, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!known.Add(NormalizeAddress(device.Address))) continue;
+
+            string name = _settings.DeviceAliases.TryGetValue(device.Address, out string? alias)
+                          && !string.IsNullOrWhiteSpace(alias)
+                ? alias.Trim()
+                : device.Name;
+
+            list.Add(new BatteryReading
+            {
+                Percent = device.Battery,
+                DeviceName = name,
+                OriginalName = device.Name,
+                Address = device.DisplayAddress,
+                Stamp = device.Stamp,
+                Source = "经典蓝牙属性",
+                Connected = true,
+                Kind = device.Kind,
+                Transport = Transport.Bluetooth,
+            });
+
+            added++;
+        }
+
+        if (added != _classicCount)
+        {
+            _classicCount = added;
+
+            // 只在台数变化时打明细，避免每分钟刷同样的行
+            foreach (ClassicDevice d in candidates)
+            {
+                bool isOnline = connected.Contains(d.Address)
+                                || (d.Stamp is DateTime s && (DateTime.Now - s).TotalMinutes < 10);
+                Log($"[经典蓝牙] {d.Name}: {d.Battery}% 在线={isOnline}");
+            }
+
+            Log($"[经典蓝牙] 在线 {added} 台（系统报告已连接 {connected.Count} 台，枚举到 {candidates.Length} 台有电量属性）");
+        }
+    }
+
+    /// <summary>
+    /// 当前处于已连接状态的经典蓝牙设备地址（12 位、大写）。
+    /// 用的是系统自己的连接状态集合，和「设置 → 蓝牙」里显示的一致；
+    /// 只做枚举，不做服务发现、不建立 GATT 会话，因此不会打扰设备。
+    /// 2.5 秒拿不到结果就按「都没连」处理——宁可少显示，也不把关机设备的旧电量当成实时值。
+    /// </summary>
+    private async Task<HashSet<string>> ConnectedClassicAsync()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            var op = DeviceInformation.FindAllAsync(
+                BluetoothDevice.GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus.Connected));
+
+            Windows.Devices.Enumeration.DeviceInformationCollection? all = await WithTimeout(op, 2500);
+            if (all == null) return set;
+
+            foreach (DeviceInformation info in all)
+            {
+                // AEP 的 Id 形如 Bluetooth#Bluetooth<适配器 MAC>-<设备 MAC>，
+                // 取**最后一个**才是设备本身；取第一个会得到适配器地址，永远匹配不上。
+                MatchCollection macs = Regex.Matches(info.Id, "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}");
+                if (macs.Count == 0) continue;
+
+                set.Add(macs[^1].Value.Replace(":", string.Empty).ToUpperInvariant());
+            }
+        }
+        catch (Exception ex)
+        {
+            // 拿不到就当没有，不影响其它通道
+            Log($"[经典蓝牙] 连接状态查询失败: {ex.GetType().Name} {ex.Message}");
+        }
+
+        return set;
+    }
+
+    /// <summary>地址比较前统一去掉冒号：BLE 侧存 12 位，显示用带冒号的格式。</summary>
+    private static string NormalizeAddress(string address) =>
+        address.Replace(":", string.Empty).Replace("-", string.Empty).Trim();
+
+    /// <summary>上次成功读到的 2.4G 电量。查询偶发失败时用它兜底，避免界面跳回蓝牙的旧缓存。</summary>
+    private readonly Dictionary<DeviceKind, (int Percent, DateTime Stamp)> _wirelessLast = new();
+
+    /// <summary>
+    /// 2.4G 读数缓存文件。键盘空闲后会进入休眠、不再应答查询，
+    /// 而程序常常是在开机时先启动的——那时缓存为空，界面就只能显示蓝牙那条一天前的旧值。
+    /// 所以把上次读到的值与时间落盘，重启后接着用。
+    /// </summary>
+    private string WirelessCachePath =>
+        Path.Combine(Path.GetDirectoryName(AppSettings.SettingsPath) ?? AppContext.BaseDirectory, "wireless-cache.json");
+
+    private sealed class CachedSample
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("p")] public int Percent { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("t")] public DateTime Stamp { get; set; }
+    }
+
+    private void LoadWirelessCache()
+    {
+        try
+        {
+            if (!File.Exists(WirelessCachePath)) return;
+
+            var saved = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, CachedSample>>(File.ReadAllText(WirelessCachePath));
+            if (saved == null) return;
+
+            foreach (KeyValuePair<string, CachedSample> pair in saved)
+            {
+                if (!Enum.TryParse(pair.Key, out DeviceKind kind)) continue;
+                if (pair.Value.Percent is <= 0 or > 100) continue;
+                _wirelessLast[kind] = (pair.Value.Percent, pair.Value.Stamp);
+            }
+        }
+        catch
+        {
+            // 缓存坏了就当作没有，不影响启动
+        }
+    }
+
+    private void SaveWirelessCache()
+    {
+        try
+        {
+            var payload = new Dictionary<string, CachedSample>();
+            foreach (KeyValuePair<DeviceKind, (int Percent, DateTime Stamp)> pair in _wirelessLast)
+            {
+                payload[pair.Key.ToString()] = new CachedSample { Percent = pair.Value.Percent, Stamp = pair.Value.Stamp };
+            }
+
+            string path = WirelessCachePath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(payload));
+        }
+        catch
+        {
+            // 忽略
+        }
+    }
+
+    /// <summary>
+    /// 把 2.4G 读数并进来。同一台设备（按类型判断）在两种连接方式下只保留一条。
+    ///
+    /// 关键点：**接收器存在就说明设备在 2.4G 上**。查询失败只是这一次没读到，
+    /// 应该沿用上次的读数（连带它的时间戳），而不是退回蓝牙那条可能已经放置一天的缓存。
+    /// 只有当蓝牙侧的数据比 2.4G 缓存更新时，才认为设备真的切回蓝牙了。
     /// </summary>
     private void MergeWireless(List<BatteryReading> list)
     {
@@ -129,47 +333,89 @@ internal sealed class BatteryMonitor : IDisposable
 
         foreach (Wireless24G.Reading w in wireless)
         {
-            int index = list.FindIndex(r => r.Kind == w.Kind);
+            if (w.Percent is int fresh)
+            {
+                bool changed = !_wirelessLast.TryGetValue(w.Kind, out (int Percent, DateTime Stamp) previous) || previous.Percent != fresh;
+                _wirelessLast[w.Kind] = (fresh, w.Stamp ?? DateTime.Now);
+                if (changed) SaveWirelessCache();
+            }
 
-            if (index < 0)
+            int index = list.FindIndex(r => r.Kind == w.Kind);
+            BatteryReading? bt = index >= 0 ? list[index] : null;
+
+            bool has2G = w.Percent.HasValue || _wirelessLast.ContainsKey(w.Kind);
+            if (!has2G)
+            {
+                // 接收器在，但一次都没读到过（刚启动、设备还在唤醒）。
+                // 这时不做任何加工：沿用蓝牙那条原值，角标也保持蓝色，
+                // 免得出现"标着 2.4G、数值其实是蓝牙旧值"的假象。
+                continue;
+            }
+
+            (int percent, DateTime stamp) = w.Percent is int value
+                ? (value, w.Stamp ?? DateTime.Now)
+                : _wirelessLast[w.Kind];
+
+            if (bt == null)
             {
                 list.Add(new BatteryReading
                 {
-                    Percent = w.Percent,
+                    Percent = percent,
                     DeviceName = w.Name,
                     OriginalName = w.Name,
                     Address = w.Address,
-                    Stamp = w.Stamp,
+                    Stamp = stamp,
                     Source = "2.4G 私有协议",
                     Connected = true,
+                    Charging = w.Charging,
                     Kind = w.Kind,
                     Transport = Transport.Wireless24G,
                 });
                 continue;
             }
 
-            BatteryReading bt = list[index];
-            // 名字和别名沿用蓝牙那条（"VGN V98 BT1" 比 "Wireless Gaming Keyboard" 好认），
-            // 但电量和时间用更新的那份
-            bool wirelessFresher = bt.Stamp is null || w.Stamp >= bt.Stamp;
+            // 蓝牙侧的数据如果比 2.4G 缓存还新，说明设备现在确实连的是蓝牙
+            bool bluetoothIsLive = bt.Stamp is DateTime btStamp && btStamp > stamp;
+            if (!w.Percent.HasValue && bluetoothIsLive)
+            {
+                list[index] = WithTransport(bt, Transport.Bluetooth);
+                Log($"[2.4G] {bt.DeviceName}: 读取失败，蓝牙侧数据更新，按蓝牙处理");
+                continue;
+            }
 
             list[index] = new BatteryReading
             {
-                Percent = wirelessFresher ? w.Percent : bt.Percent,
-                DeviceName = bt.DeviceName,
+                Percent = percent,
+                DeviceName = bt.DeviceName,     // 名字沿用蓝牙那条，切换模式时列表不跳名称
                 OriginalName = bt.OriginalName,
                 Address = bt.Address,
-                Stamp = wirelessFresher ? w.Stamp : bt.Stamp,
-                Source = wirelessFresher ? "2.4G 私有协议" : bt.Source,
+                Stamp = stamp,
+                Source = w.Percent.HasValue ? "2.4G 私有协议" : "2.4G 私有协议（上次读数）",
                 Connected = true,
                 Subscribed = bt.Subscribed,
+                Charging = w.Percent.HasValue && w.Charging,
                 Kind = bt.Kind,
-                Transport = wirelessFresher ? Transport.Wireless24G : bt.Transport,
+                Transport = Transport.Wireless24G,
             };
 
-            Log($"[2.4G] {bt.DeviceName}: {w.Percent}% (蓝牙 {bt.Percent?.ToString() ?? "无"}%)");
+            Log($"[2.4G] {bt.DeviceName}: {percent}%{(w.Charging ? " 充电中" : "")}{(w.Percent.HasValue ? "" : "（本轮未响应，沿用上次）")} (蓝牙 {bt.Percent?.ToString() ?? "无"}%)");
         }
     }
+
+    private static BatteryReading WithTransport(BatteryReading source, Transport transport) => new()
+    {
+        Percent = source.Percent,
+        DeviceName = source.DeviceName,
+        OriginalName = source.OriginalName,
+        Address = source.Address,
+        Stamp = source.Stamp,
+        Source = source.Source,
+        Connected = source.Connected,
+        Subscribed = source.Subscribed,
+        Charging = source.Charging,
+        Kind = source.Kind,
+        Transport = transport,
+    };
 
     /// <summary>过滤出要显示的设备：有系统缓存电量，或已有 GATT 读数。</summary>
     private List<BleDevice> SelectDevices(List<BleDevice> all)
@@ -323,48 +569,61 @@ internal sealed class BatteryMonitor : IDisposable
                 return false;
             }
 
-            var svcResult = await WithTimeout(
-                ch.Device.GetGattServicesForUuidAsync(BatteryServiceUuid, BluetoothCacheMode.Uncached),
-                GattTimeoutMs);
+            GattCharacteristic? characteristic = ch.Characteristic;
 
-            if (svcResult?.Status != GattCommunicationStatus.Success || svcResult.Services.Count == 0)
+            // 已经拿到特征就跳过服务发现。每轮都做一次 Uncached 发现会在链路上来回跑，
+            // 把设备从省电状态拽起来——蓝牙鼠标会表现出"周期性断联一下"
+            if (characteristic == null)
             {
-                Log($"[GATT] {Label(target)}: 电池服务不可用: {svcResult?.Status}");
-                return false;
-            }
+                var svcResult = await WithTimeout(
+                    ch.Device.GetGattServicesForUuidAsync(BatteryServiceUuid, BluetoothCacheMode.Uncached),
+                    GattTimeoutMs);
 
-            var service = svcResult.Services[0];
-            var chResult = await WithTimeout(
-                service.GetCharacteristicsForUuidAsync(BatteryLevelUuid, BluetoothCacheMode.Uncached),
-                GattTimeoutMs);
-
-            if (chResult?.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0)
-            {
-                Log($"[GATT] {Label(target)}: 电量特征不可用: {chResult?.Status}");
-                return false;
-            }
-
-            GattCharacteristic characteristic = chResult.Characteristics[0];
-            ch.Characteristic = characteristic;
-
-            // 主动读一次，拿到当前真实值
-            var readResult = await WithTimeout(characteristic.ReadValueAsync(BluetoothCacheMode.Uncached), GattTimeoutMs);
-            if (readResult?.Status == GattCommunicationStatus.Success)
-            {
-                byte value = ReadByte(readResult.Value);
-                if (value <= 100)
+                if (svcResult?.Status != GattCommunicationStatus.Success || svcResult.Services.Count == 0)
                 {
-                    lock (_gate)
-                    {
-                        ch.Percent = value;
-                        ch.Stamp = DateTime.Now;
-                    }
-                    Log($"[GATT] {Label(target)}: 主动读取 = {value}%");
+                    Log($"[GATT] {Label(target)}: 电池服务不可用: {svcResult?.Status}");
+                    return false;
                 }
+
+                var service = svcResult.Services[0];
+                var chResult = await WithTimeout(
+                    service.GetCharacteristicsForUuidAsync(BatteryLevelUuid, BluetoothCacheMode.Uncached),
+                    GattTimeoutMs);
+
+                if (chResult?.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0)
+                {
+                    Log($"[GATT] {Label(target)}: 电量特征不可用: {chResult?.Status}");
+                    return false;
+                }
+
+                characteristic = chResult.Characteristics[0];
+                ch.Characteristic = characteristic;
             }
-            else
+
+            // 已经订阅上就靠推送拿值，不再主动读——主动读同样会打扰设备。
+            // 只有没订阅、或数据已经 10 分钟没动过时，才补一次主动读。
+            bool stale = ch.Stamp is null || (DateTime.Now - ch.Stamp.Value).TotalMinutes > 10;
+            if (!ch.Subscribed || stale)
             {
-                Log($"[GATT] {Label(target)}: 读取失败: {readResult?.Status}");
+                var readResult = await WithTimeout(characteristic.ReadValueAsync(BluetoothCacheMode.Uncached), GattTimeoutMs);
+                if (readResult?.Status == GattCommunicationStatus.Success)
+                {
+                    byte value = ReadByte(readResult.Value);
+                    // 0 当无效：休眠前的伪读数，真实 0% 早该报过低电量了
+                    if (value is > 0 and <= 100)
+                    {
+                        lock (_gate)
+                        {
+                            ch.Percent = value;
+                            ch.Stamp = DateTime.Now;
+                        }
+                        Log($"[GATT] {Label(target)}: 主动读取 = {value}%");
+                    }
+                }
+                else
+                {
+                    Log($"[GATT] {Label(target)}: 读取失败: {readResult?.Status}");
+                }
             }
 
             // 订阅推送，这是「实时」的来源
@@ -411,7 +670,7 @@ internal sealed class BatteryMonitor : IDisposable
         try
         {
             byte value = ReadByte(args.CharacteristicValue);
-            if (value > 100) return;
+            if (value is <= 0 or > 100) return;
 
             lock (_gate)
             {

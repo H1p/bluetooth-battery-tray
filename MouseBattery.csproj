@@ -13,8 +13,8 @@
     <RootNamespace>MouseBattery</RootNamespace>
     <Product>设备电量</Product>
     <AssemblyTitle>设备电量</AssemblyTitle>
-    <Version>1.6.0</Version>
-    <FileVersion>1.6.0</FileVersion>
+    <Version>1.7.0</Version>
+    <FileVersion>1.7.0</FileVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>

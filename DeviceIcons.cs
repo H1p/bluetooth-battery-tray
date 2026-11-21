@@ -75,6 +75,25 @@ internal static class DeviceIcons
         _ => "蓝牙设备",
     };
 
+    private static readonly Dictionary<(DeviceKind Kind, int Size, int Argb), Bitmap> GlyphCache = new();
+
+    /// <summary>
+    /// 取带缓存的图标位图。同一（类型 × 尺寸 × 颜色）只画一次，调用方**不要 Dispose**。
+    /// 组合数量有限（5 种类型 × 两三个尺寸 × 几个电量档位色），缓存不会无限增长。
+    /// </summary>
+    public static Bitmap GetGlyph(DeviceKind kind, int size, Color color)
+    {
+        var key = (kind, size, color.ToArgb());
+        lock (GlyphCache)
+        {
+            if (GlyphCache.TryGetValue(key, out Bitmap? cached)) return cached;
+
+            Bitmap created = Render(kind, size, color);
+            GlyphCache[key] = created;
+            return created;
+        }
+    }
+
     public static Bitmap Render(DeviceKind kind, int size, Color color)
     {
         var bmp = new Bitmap(size, size);
@@ -157,6 +176,117 @@ internal static class DeviceIcons
         {
             g.DrawString(text, font, textBrush, pill.Left + padX, pill.Top + padY - 0.6f * scale);
         }
+    }
+
+    /// <summary>充电标识的琥珀色，与历史图里的充电底色同一色系。</summary>
+    public static readonly Color ChargingColor = Color.FromArgb(240, 150, 24);
+
+    /// <summary>充电徽标里的文字，画在徽标内。</summary>
+    public const string ChargingText = "充电中";
+
+    /// <summary>徽标高度（未缩放）。文字和留白都按它推算，改这里其它尺寸自动跟着变。</summary>
+    private const float BadgeHeight = 15f;
+
+    private static Font? _badgeFont;
+    private static Font BadgeFont => _badgeFont ??= new Font("Microsoft YaHei UI", 7.2f);
+
+    /// <summary>在给定方框内画一个闪电，表示「正在充电」。</summary>
+    public static void DrawChargingBolt(Graphics g, RectangleF box, Color color)
+    {
+        float x = box.Left, y = box.Top, w = box.Width, h = box.Height;
+
+        PointF[] bolt =
+        {
+            new(x + w * 0.60f, y),
+            new(x + w * 0.20f, y + h * 0.56f),
+            new(x + w * 0.46f, y + h * 0.56f),
+            new(x + w * 0.38f, y + h),
+            new(x + w * 0.80f, y + h * 0.40f),
+            new(x + w * 0.52f, y + h * 0.40f),
+        };
+
+        using var brush = new SolidBrush(color);
+        g.FillPolygon(brush, bolt);
+    }
+
+    /// <summary>
+    /// 量出充电徽标的宽度。withText 为 true 时带「充电中」三个字，否则只画闪电。
+    /// 徽标贴右边缘使用，所以调用方拿到宽度后按 right - width 定位。
+    /// </summary>
+    public static float MeasureChargingBadge(Graphics g, float scale, bool withText)
+    {
+        float padX = 5.5f * scale;
+        float boltW = 7.5f * scale;
+        float gap = 3f * scale;
+
+        float w = padX * 2 + boltW;
+        if (withText) w += gap + g.MeasureString(ChargingText, BadgeFont).Width;
+        return w;
+    }
+
+    /// <summary>
+    /// 画充电徽标：琥珀色圆角底 + 白色闪电（+ 可选「充电中」）。
+    /// 实心底比一根细闪电显眼得多，缩到托盘卡片那个尺寸也一眼能认出来。
+    /// right/top 是徽标的右上角，返回实际宽度。
+    /// </summary>
+    public static float DrawChargingBadge(Graphics g, float right, float top, float scale, bool withText)
+    {
+        float h = BadgeHeight * scale;
+        float padX = 5.5f * scale;
+        float boltW = 7.5f * scale;
+        float gap = 3f * scale;
+
+        float w = MeasureChargingBadge(g, scale, withText);
+        var box = new RectangleF(right - w, top, w, h);
+
+        using (GraphicsPath path = RoundedRect(box, h / 2f))
+        using (var fill = new SolidBrush(ChargingColor))
+        {
+            g.FillPath(fill, path);
+        }
+
+        DrawChargingBolt(
+            g,
+            new RectangleF(box.Left + padX, box.Top + h * 0.17f, boltW, h * 0.66f),
+            Color.White);
+
+        if (withText)
+        {
+            using var white = new SolidBrush(Color.White);
+            SizeF textSize = g.MeasureString(ChargingText, BadgeFont);
+            g.DrawString(
+                ChargingText,
+                BadgeFont,
+                white,
+                box.Left + padX + boltW + gap,
+                box.Top + (h - textSize.Height) / 2f - 0.5f * scale);
+        }
+
+        return w;
+    }
+
+    /// <summary>给控件用：渲染一张透明底的徽标位图，调用方负责释放。</summary>
+    public static Bitmap RenderChargingBadge(int width, int height)
+    {
+        var bmp = new Bitmap(Math.Max(1, width), Math.Max(1, height));
+        using (Graphics g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Color.Transparent);
+
+            using (GraphicsPath path = RoundedRect(new RectangleF(0, 0, bmp.Width, bmp.Height), bmp.Height / 2f))
+            using (var fill = new SolidBrush(ChargingColor))
+            {
+                g.FillPath(fill, path);
+            }
+
+            DrawChargingBolt(
+                g,
+                new RectangleF(bmp.Width * 0.27f, bmp.Height * 0.17f, bmp.Width * 0.46f, bmp.Height * 0.66f),
+                Color.White);
+        }
+
+        return bmp;
     }
 
     private static GraphicsPath RoundedRect(RectangleF rect, float radius)

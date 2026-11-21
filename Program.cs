@@ -83,6 +83,53 @@ internal static class Program
         }
 
         // 诊断模式：单独渲染悬停卡片并截图，用来核对多设备列表的排版
+        // 诊断模式：用一份虚构的历史数据渲染历史窗口，核对折线图排版
+        string? historyPreviewArg = args
+            .FirstOrDefault(a => a.StartsWith("--history-preview=", StringComparison.OrdinalIgnoreCase))?
+            .Split('=', 2)[1];
+
+        if (historyPreviewArg != null || args.Any(a => a.Equals("--history-preview", StringComparison.OrdinalIgnoreCase)))
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            // 默认造一份假数据；带路径参数时直接读指定文件，便于拿真实/构造的数据核对渲染
+            string fake = historyPreviewArg ?? Path.Combine(Path.GetTempPath(), "mb-history-preview.json");
+            if (historyPreviewArg == null) WriteHistoryPreviewData(fake);
+
+            using var store = new HistoryStore(fake);
+            var form = new HistoryForm(store);
+            var chartTimer = new System.Windows.Forms.Timer { Interval = 1600 };
+            chartTimer.Tick += (_, _) =>
+            {
+                chartTimer.Stop();
+                CaptureForm(form, "history-preview.png");
+                form.Close();
+            };
+            form.Shown += (_, _) =>
+            {
+                // 截图前切到指定范围、把提示框定在一个采样点上，便于核对样式
+                int range = 0;
+                string? rangeArg = args
+                    .FirstOrDefault(a => a.StartsWith("--range=", StringComparison.OrdinalIgnoreCase))?
+                    .Split('=', 2)[1];
+                if (rangeArg != null) int.TryParse(rangeArg, out range);
+
+                form.PreviewRange(range);
+
+                // 出文档图时不需要提示框，免得盖住图例
+                if (args.Any(a => a.Equals("--nohover", StringComparison.OrdinalIgnoreCase)))
+                    form.PreviewHoverOff();
+                else
+                    form.PreviewHover(30);
+                chartTimer.Start();
+            };
+
+            Application.Run(form);
+            if (historyPreviewArg == null) { try { File.Delete(fake); } catch { } }
+            return 0;
+        }
+
         if (args.Any(a => a.Equals("--hover-preview", StringComparison.OrdinalIgnoreCase)))
         {
             Application.EnableVisualStyles();
@@ -211,7 +258,7 @@ internal static class Program
                 sb.AppendLine($"      地址: {reading.Address}");
                 sb.AppendLine($"      电量: {(reading.Percent is int p ? p + "%" : "未知")}");
                 sb.AppendLine($"      来源: {reading.Source}");
-                sb.AppendLine($"      订阅: {reading.Subscribed}  连接: {reading.Connected}");
+                sb.AppendLine($"      订阅: {reading.Subscribed}  连接: {reading.Connected}  充电: {reading.Charging}");
                 sb.AppendLine($"      采集: {reading.Stamp:yyyy-MM-dd HH:mm:ss}");
                 if (reading.Error != null) sb.AppendLine($"      说明: {reading.Error}");
             }
@@ -399,6 +446,7 @@ internal static class Program
                 Address = "02:00:00:00:00:02",
                 Source = "2.4G 私有协议",
                 Connected = true,
+                Charging = true,
                 Stamp = DateTime.Now.AddSeconds(-20),
                 Kind = DeviceKind.Keyboard,
                 Transport = Transport.Wireless24G,
@@ -415,6 +463,36 @@ internal static class Program
                 Kind = DeviceKind.Headset,
             },
         };
+    }
+
+    /// <summary>造一份 24 小时的假数据给 --history-preview 用，中间留一段空档模拟设备离线。</summary>
+    private static void WriteHistoryPreviewData(string path)
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"version\":1,\"devices\":[{\"id\":\"preview\",\"name\":\"示例键盘\",\"points\":[");
+
+        DateTime now = DateTime.Now;
+        bool first = true;
+
+        for (int step = 48; step >= 0; step--)
+        {
+            if (step is >= 20 and <= 23) continue;      // 两小时空档
+
+            DateTime time = now.AddMinutes(-step * 30);
+
+            // 最早 6 个点模拟充电：数值上升，并带上充电标志
+            bool charging = step >= 43;
+            int percent = charging
+                ? 58 + (48 - step) * 7
+                : Math.Clamp(94 - (48 - step) / 3 + (step % 4) - 1, 15, 100);
+
+            if (!first) sb.Append(',');
+            sb.Append($"{{\"t\":{time.Ticks},\"p\":{percent}{(charging ? ",\"c\":true" : string.Empty)}}}");
+            first = false;
+        }
+
+        sb.Append("]}]}");
+        File.WriteAllText(path, sb.ToString());
     }
 
     private static void CaptureForm(Form form, string fileName)

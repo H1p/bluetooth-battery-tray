@@ -14,7 +14,7 @@ internal sealed class AppSettings
     /// <summary>低电量提醒阈值，百分比。</summary>
     public int LowThreshold { get; set; } = 20;
 
-    /// <summary>低于此电量显示红色。</summary>
+    /// <summary>不高于此电量显示红色（含等于）。</summary>
     public int ColorRedBelow { get; set; } = 20;
 
     /// <summary>达到此电量显示绿色，中间区间为黄色。</summary>
@@ -33,7 +33,12 @@ internal sealed class AppSettings
     public bool AutoStart { get; set; }
 
     /// <summary>是否启用 GATT 主动订阅（关掉则只读系统缓存）。</summary>
-    public bool UseGatt { get; set; } = true;
+    /// <summary>
+    /// 默认关闭。部分蓝牙鼠标受不了被建立 GATT 客户端会话——
+    /// 哪怕只是订阅、不发任何读请求，也会瞬断（实测 Xiaoxin Mouse 5.0 如此）。
+    /// 关掉后电量仍能从系统缓存读到，只是没有"一上报就刷新"。
+    /// </summary>
+    public bool UseGatt { get; set; } = false;
 
     /// <summary>
     /// 设备自定义名称。键是 12 位十六进制 MAC（小写、不带冒号），值是显示名。

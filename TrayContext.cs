@@ -49,6 +49,7 @@ internal sealed class TrayContext : ApplicationContext
 {
     private readonly AppSettings _settings;
     private readonly BatteryMonitor _monitor;
+    private readonly HistoryStore _history;
     private readonly NotifyIcon _tray;
     private readonly ContextMenuStrip _menu;
     private readonly System.Windows.Forms.Timer _timer;
@@ -57,7 +58,6 @@ internal sealed class TrayContext : ApplicationContext
 
     private readonly ToolStripMenuItem _headerItem;
     private readonly ToolStripMenuItem _detailItem;
-    private readonly ToolStripMenuItem _refreshItem;
     private readonly ToolStripMenuItem _autoStartItem;
 
     /// <summary>已提醒过低电量的设备（键是 MAC），电量回升 5 个点后才允许再提醒。</summary>
@@ -82,8 +82,6 @@ internal sealed class TrayContext : ApplicationContext
 
         _headerItem = new ToolStripMenuItem("正在读取…") { Enabled = false, Font = _headerFont };
         _detailItem = new ToolStripMenuItem(string.Empty) { Enabled = false };
-        var editItem = new ToolStripMenuItem("编辑设备名称…", null, (_, _) => EditDeviceNames());
-        _refreshItem = new ToolStripMenuItem("立即刷新全部", null, async (_, _) => await RefreshAsync(true));
         var settingsItem = new ToolStripMenuItem("设置…", null, (_, _) => OpenSettings());
         _autoStartItem = new ToolStripMenuItem("开机自动启动", null, (_, _) => ToggleAutoStart())
         {
@@ -98,8 +96,6 @@ internal sealed class TrayContext : ApplicationContext
             _headerItem,
             _detailItem,
             new ToolStripSeparator(),
-            editItem,
-            _refreshItem,
             settingsItem,
             _autoStartItem,
             new ToolStripSeparator(),
@@ -123,6 +119,9 @@ internal sealed class TrayContext : ApplicationContext
         _hoverDelay.Tick += (_, _) => OnHoverDelayElapsed();
 
         _monitor = new BatteryMonitor(_settings);
+        _history = new HistoryStore(Path.Combine(
+            Path.GetDirectoryName(AppSettings.SettingsPath) ?? AppContext.BaseDirectory,
+            "history.json"));
         _monitor.DeviceUpdated += reading => ApplyOne(reading);
 
         _timer = new System.Windows.Forms.Timer { Interval = _settings.PollSeconds * 1000 };
@@ -155,7 +154,9 @@ internal sealed class TrayContext : ApplicationContext
         _busy = true;
         try
         {
-            SetRefreshing(true);
+            // 手动刷新（双击、设置里的刷新）视为用户主动催更，重置静默计数
+            if (force) _idleStreak = 0;
+
             List<BatteryReading> list = await _monitor.PollAllAsync(force, allowGatt: !skipGatt);
             Apply(list);
         }
@@ -165,15 +166,8 @@ internal sealed class TrayContext : ApplicationContext
         }
         finally
         {
-            SetRefreshing(false);
             _busy = false;
         }
-    }
-
-    private void SetRefreshing(bool on)
-    {
-        _refreshItem.Enabled = !on;
-        _refreshItem.Text = on ? "刷新中…" : "立即刷新全部";
     }
 
     private void Apply(IReadOnlyList<BatteryReading> readings)
@@ -187,6 +181,50 @@ internal sealed class TrayContext : ApplicationContext
         if (HoverCard.Current != null) HoverCard.ShowOrUpdate(readings);
 
         foreach (BatteryReading reading in readings) CheckLowBattery(reading);
+
+        TrackIdle(readings);
+        _history.Record(readings);
+    }
+
+    // ---------------------------------------------------------------- 轮询节奏
+
+    private string _lastSignature = string.Empty;
+    private int _idleStreak;
+
+    /// <summary>
+    /// 数据没变化就逐步拉长轮询间隔，避免空转。
+    /// 一次全量枚举要遍历所有 HID/BLE 设备，没变化时每分钟做一遍纯属浪费。
+    /// GATT 推送会直接把新值送进来，所以拉长间隔不会漏掉电量变化。
+    /// </summary>
+    private void TrackIdle(IReadOnlyList<BatteryReading> readings)
+    {
+        string signature = string.Join(
+            "|",
+            readings.Select(r => $"{r.Address}:{r.Percent}:{r.Connected}:{r.Transport}"));
+
+        if (signature != _lastSignature)
+        {
+            _lastSignature = signature;
+            _idleStreak = 0;
+        }
+        else
+        {
+            _idleStreak++;
+        }
+
+        int factor = _idleStreak switch
+        {
+            < 4 => 1,
+            < 8 => 2,
+            < 12 => 5,
+            _ => 10,
+        };
+
+        int interval = Math.Clamp(_settings.PollSeconds * 1000 * factor, 10_000, int.MaxValue);
+        if (_timer.Interval == interval) return;
+
+        _timer.Interval = interval;
+        if (factor > 1) _monitor.Log($"[调度] 数据连续 {_idleStreak} 轮无变化，间隔 ×{factor}");
     }
 
     /// <summary>GATT 推送只带一台设备时，替换列表里那一台再整体刷新。</summary>
@@ -197,6 +235,15 @@ internal sealed class TrayContext : ApplicationContext
         var list = _readings.ToList();
         int index = list.FindIndex(r => string.Equals(r.Address, reading.Address, StringComparison.OrdinalIgnoreCase));
         if (index < 0) return;
+
+        // 2.4G 的合并结果不能被更旧的蓝牙推送覆盖：
+        // 键盘挂在 2.4G 时，蓝牙那条往往是一两天前的缓存，GATT 一推送就会把界面拉回旧值
+        BatteryReading existing = list[index];
+        if (existing.Transport == Transport.Wireless24G
+            && (reading.Stamp is null || existing.Stamp is null || reading.Stamp <= existing.Stamp))
+        {
+            return;
+        }
 
         list[index] = reading;
         Apply(list);
@@ -338,18 +385,6 @@ internal sealed class TrayContext : ApplicationContext
         _monitor.Log($"[通知] {reading.DeviceName} 低电量 {p}%");
     }
 
-    private void EditDeviceNames()
-    {
-        HoverCard.HideCard();
-
-        using var form = new DeviceNameForm(_settings, _readings);
-        if (form.ShowDialog() != DialogResult.OK) return;
-
-        _settings.Normalized();
-        _settings.Save();
-        _ = RefreshAsync(true);
-    }
-
     private void OpenSettings()
     {
         HoverCard.HideCard();
@@ -363,7 +398,8 @@ internal sealed class TrayContext : ApplicationContext
             {
                 await RefreshAsync(true);
                 return _readings;
-            });
+            },
+            _history);
 
         form.ShowDialog();
 
@@ -397,6 +433,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _tray.Visible = false;
         _monitor.Dispose();
+        _history.Dispose();
         _tray.Dispose();
         _menu.Dispose();
         _headerFont.Dispose();

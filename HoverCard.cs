@@ -324,10 +324,9 @@ internal sealed class HoverCard : Form
             int top = headerH + i * rowH;
             Color color = BatteryIcon.ColorFor(reading.Percent, reading.Connected);
 
-            using (Bitmap icon = DeviceIcons.Render(reading.Kind, S(20), color))
-            {
-                g.DrawImage(icon, new Rectangle(padX, top + S(6), S(20), S(20)));
-            }
+            // 图标走缓存，不要 Dispose
+            Bitmap icon = DeviceIcons.GetGlyph(reading.Kind, S(20), color);
+            g.DrawImage(icon, new Rectangle(padX, top + S(6), S(20), S(20)));
 
             DeviceIcons.DrawTransportBadge(
                 g,
@@ -337,7 +336,20 @@ internal sealed class HoverCard : Form
 
             int textLeft = padX + S(26);
             int pctWidth = S(52);
-            var nameRect = new RectangleF(textLeft, top + S(5), w - textLeft - padX - pctWidth, S(17));
+
+            string percentText = reading.Connected
+                ? (reading.Percent is int p ? $"{p}%" : "未知")
+                : "未连接";
+
+            float percentTextWidth = g.MeasureString(percentText, pctFont).Width;
+
+            // 充电徽标贴在百分比左侧：实心琥珀底 + 白闪电 + 「充电中」，比一根细闪电醒目
+            float badgeSpace = 0f;
+            bool showCharging = reading.Charging && reading.Connected;
+            if (showCharging) badgeSpace = DeviceIcons.MeasureChargingBadge(g, _scale, true) + S(6);
+
+            var nameRect = new RectangleF(
+                textLeft, top + S(5), w - textLeft - padX - pctWidth - badgeSpace, S(17));
             using (var nameFormat = new StringFormat(StringFormatFlags.NoWrap)
             {
                 Trimming = StringTrimming.EllipsisCharacter,
@@ -346,9 +358,16 @@ internal sealed class HoverCard : Form
                 g.DrawString(reading.DeviceName, nameFont, reading.Connected ? ink : muted, nameRect, nameFormat);
             }
 
-            string percentText = reading.Connected
-                ? (reading.Percent is int p ? $"{p}%" : "未知")
-                : "未连接";
+            if (showCharging)
+            {
+                DeviceIcons.DrawChargingBadge(
+                    g,
+                    w - padX - percentTextWidth - S(6),
+                    top + S(6),
+                    _scale,
+                    withText: true);
+            }
+
             var pctRect = new RectangleF(w - padX - pctWidth, top + S(5), pctWidth, S(17));
             using (var pctFormat = new StringFormat(StringFormatFlags.NoWrap) { Alignment = StringAlignment.Far })
             using (var pctBrush = new SolidBrush(color))

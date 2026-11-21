@@ -14,7 +14,7 @@ internal static class BatteryIcon
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr hIcon);
 
-    /// <summary>低于此值显示红色，由设置界面配置。</summary>
+    /// <summary>不高于此值显示红色（含等于），由设置界面配置。</summary>
     public static int RedBelow { get; private set; } = 20;
 
     /// <summary>达到此值显示绿色，中间为黄色。</summary>
@@ -29,7 +29,7 @@ internal static class BatteryIcon
     public static Color ColorFor(int? percent, bool connected)
     {
         if (!connected || percent is null) return Color.FromArgb(158, 158, 158);
-        if (percent < RedBelow) return Color.FromArgb(216, 58, 44);
+        if (percent <= RedBelow) return Color.FromArgb(216, 58, 44);
         if (percent < GreenFrom) return Color.FromArgb(224, 158, 18);
         return Color.FromArgb(46, 168, 74);
     }

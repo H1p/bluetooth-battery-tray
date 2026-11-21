@@ -39,11 +39,17 @@ internal sealed class SettingsForm : Form
     private bool _suspendUnitEvent;
     private readonly List<(BatteryReading Reading, Label Label)> _nameLabels = new();
 
+    // 设备行里反复用到的字体，建一次复用；重建时不再 new Font，避免 GDI 句柄累积
+    private readonly Font _rowNameFont = new("Microsoft YaHei UI", 9f, FontStyle.Bold);
+    private readonly Font _rowStampFont = new("Microsoft YaHei UI", 7.8f);
+    private readonly Font _rowPercentFont = new("Microsoft YaHei UI", 9.4f, FontStyle.Bold);
+
     public SettingsForm(
         AppSettings settings,
         IReadOnlyList<BatteryReading> readings,
         Action<string, string>? previewNotify = null,
-        Func<Task<IReadOnlyList<BatteryReading>>>? refresh = null)
+        Func<Task<IReadOnlyList<BatteryReading>>>? refresh = null,
+        HistoryStore? history = null)
     {
         _settings = settings;
         _readings = readings;
@@ -101,24 +107,39 @@ internal sealed class SettingsForm : Form
 
         var lblCaveat = new Label
         {
-            Text = "刷新速度由设备固件决定",
+            Text = "刷新速度由固件决定",
             Location = new Point(S(15), footerY + S(5)),
-            Size = new Size(S(210), S(16)),
+            Size = new Size(S(150), S(16)),
             ForeColor = Color.FromArgb(140, 140, 140),
             Font = new Font("Microsoft YaHei UI", 7.5f),
+        };
+
+        var btnHistory = new Button
+        {
+            Text = "历史记录…",
+            Location = new Point(S(166), footerY),
+            Size = new Size(S(78), S(24)),
+            FlatStyle = FlatStyle.System,
+            Font = new Font("Microsoft YaHei UI", 8.5f),
+        };
+        btnHistory.Click += (_, _) =>
+        {
+            if (history == null) return;
+            using var form = new HistoryForm(history);
+            form.ShowDialog(this);
         };
 
         var btnEditNames = new Button
         {
             Text = "编辑设备名称…",
-            Location = new Point(S(236), footerY),
-            Size = new Size(S(136), S(24)),
+            Location = new Point(S(250), footerY),
+            Size = new Size(S(122), S(24)),
             FlatStyle = FlatStyle.System,
             Font = new Font("Microsoft YaHei UI", 8.5f),
         };
         btnEditNames.Click += (_, _) => EditDeviceNames();
 
-        _deviceBox.Controls.AddRange(new Control[] { _btnRefresh, _rowHost, lblCaveat, btnEditNames });
+        _deviceBox.Controls.AddRange(new Control[] { _btnRefresh, _rowHost, lblCaveat, btnHistory, btnEditNames });
         BuildDeviceRows(readings);
 
         // ---- 提醒
@@ -132,7 +153,7 @@ internal sealed class SettingsForm : Form
 
         var lblThreshold = new Label
         {
-            Text = "低于",
+            Text = "≤",
             Location = new Point(S(14), S(30)),
             Size = new Size(S(40), S(22)),
             TextAlign = ContentAlignment.MiddleLeft,
@@ -158,7 +179,7 @@ internal sealed class SettingsForm : Form
 
         var lblRed = new Label
         {
-            Text = "红色 低于",
+            Text = "红色 ≤",
             Location = new Point(S(14), S(64)),
             Size = new Size(S(74), S(22)),
             TextAlign = ContentAlignment.MiddleLeft,
@@ -351,14 +372,29 @@ internal sealed class SettingsForm : Form
         });
     }
 
+    /// <summary>
+    /// 清空设备行。Controls.Clear() 只是把控件从集合里摘掉、**不会释放**，
+    /// 所以这里自己 Dispose，否则每点一次「刷新」都会漏掉控件和它们的位图。
+    /// </summary>
+    private void ClearRows()
+    {
+        foreach (Control c in _rowHost.Controls.Cast<Control>().ToArray())
+        {
+            if (c is PictureBox { Image: { } image }) image.Dispose();
+            c.Dispose();
+        }
+
+        _rowHost.Controls.Clear();
+        _nameLabels.Clear();
+    }
+
     /// <summary>重建设备行。刷新后设备数量可能变化，所以整块重建而不是逐个改文本。</summary>
     private void BuildDeviceRows(IReadOnlyList<BatteryReading> readings)
     {
         _rowHost.SuspendLayout();
         try
         {
-            _rowHost.Controls.Clear();
-            _nameLabels.Clear();
+            ClearRows();
 
             if (readings.Count == 0)
             {
@@ -397,38 +433,37 @@ internal sealed class SettingsForm : Form
                     const int padTop = 6;
                     const int padRight = 12;
 
-                    using (Bitmap glyph = DeviceIcons.Render(r.Kind, S(iconSize), color))
+                    // 基础图标走缓存（不要 Dispose），画布每行一张，重建时由 ClearRows 释放
+                    Bitmap glyph = DeviceIcons.GetGlyph(r.Kind, S(iconSize), color);
+                    var canvas = new Bitmap(S(iconSize + padRight), S(iconSize + padTop));
+                    using (Graphics cg = Graphics.FromImage(canvas))
                     {
-                        var canvas = new Bitmap(S(iconSize + padRight), S(iconSize + padTop));
-                        using (Graphics cg = Graphics.FromImage(canvas))
-                        {
-                            cg.SmoothingMode = SmoothingMode.AntiAlias;
-                            cg.Clear(Color.Transparent);
-                            cg.DrawImage(glyph, 0, S(padTop));
-                            DeviceIcons.DrawTransportBadge(
-                                cg,
-                                new RectangleF(0, S(padTop), S(iconSize), S(iconSize)),
-                                r.Transport,
-                                _scale);
-                        }
-
-                        var iconBox = new PictureBox
-                        {
-                            Location = new Point(S(15), rowY + S(2) - S(padTop)),
-                            Size = canvas.Size,
-                            SizeMode = PictureBoxSizeMode.Normal,
-                            Image = canvas,
-                            BackColor = Color.Transparent,
-                        };
-                        _rowHost.Controls.Add(iconBox);
+                        cg.SmoothingMode = SmoothingMode.AntiAlias;
+                        cg.Clear(Color.Transparent);
+                        cg.DrawImage(glyph, 0, S(padTop));
+                        DeviceIcons.DrawTransportBadge(
+                            cg,
+                            new RectangleF(0, S(padTop), S(iconSize), S(iconSize)),
+                            r.Transport,
+                            _scale);
                     }
+
+                    var iconBox = new PictureBox
+                    {
+                        Location = new Point(S(15), rowY + S(2) - S(padTop)),
+                        Size = canvas.Size,
+                        SizeMode = PictureBoxSizeMode.Normal,
+                        Image = canvas,
+                        BackColor = Color.Transparent,
+                    };
+                    _rowHost.Controls.Add(iconBox);
 
                     var lblName = new Label
                     {
                         Text = string.IsNullOrEmpty(r.DeviceName) ? "未知设备" : r.DeviceName,
                         Location = new Point(S(41), rowY),
                         Size = new Size(S(168), S(22)),
-                        Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold),
+                        Font = _rowNameFont,
                         AutoEllipsis = true,
                         TextAlign = ContentAlignment.MiddleLeft,
                     };
@@ -440,7 +475,7 @@ internal sealed class SettingsForm : Form
                         Location = new Point(S(211), rowY),
                         Size = new Size(S(78), S(22)),
                         ForeColor = Color.FromArgb(150, 150, 150),
-                        Font = new Font("Microsoft YaHei UI", 7.8f),
+                        Font = _rowStampFont,
                         TextAlign = ContentAlignment.MiddleRight,
                     };
 
@@ -450,11 +485,29 @@ internal sealed class SettingsForm : Form
                         Location = new Point(S(291), rowY),
                         Size = new Size(S(80), S(22)),
                         ForeColor = color,
-                        Font = new Font("Microsoft YaHei UI", 9.4f, FontStyle.Bold),
+                        Font = _rowPercentFont,
                         TextAlign = ContentAlignment.MiddleRight,
                     };
 
                     _rowHost.Controls.AddRange(new Control[] { lblName, lblStamp, lblRowPercent });
+
+                    // 充电中：在百分比左边贴一枚琥珀色徽标（白闪电），位置按实际文字宽度算
+                    if (r.Charging)
+                    {
+                        int textWidth = TextRenderer.MeasureText(lblRowPercent.Text, _rowPercentFont).Width;
+                        int badgeW = S(18);
+                        int badgeH = S(15);
+
+                        _rowHost.Controls.Add(new PictureBox
+                        {
+                            Location = new Point(lblRowPercent.Right - textWidth - S(5) - badgeW, rowY + S(4)),
+                            Size = new Size(badgeW, badgeH),
+                            SizeMode = PictureBoxSizeMode.Normal,
+                            Image = DeviceIcons.RenderChargingBadge(badgeW, badgeH),
+                            BackColor = Color.Transparent,
+                        });
+                    }
+
                     _nameLabels.Add((r, lblName));
                 }
             }
@@ -491,6 +544,17 @@ internal sealed class SettingsForm : Form
     }
 
     private int S(int baseValue) => (int)Math.Round(baseValue * _scale);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _rowNameFont.Dispose();
+            _rowStampFont.Dispose();
+            _rowPercentFont.Dispose();
+        }
+        base.Dispose(disposing);
+    }
 
     private static float GetDpiScale()
     {
@@ -606,8 +670,8 @@ internal sealed class SettingsForm : Form
         string kindText = DeviceIcons.Describe(kind);
         string title = $"{kindText}电量仅剩（测试）";
         string body = first?.Percent is int p
-            ? $"{first.DeviceName} 电量 {p}%，低于 {_threshold.Value}% 时会这样提醒你。"
-            : $"设备电量低于 {_threshold.Value}% 时会这样提醒你。";
+            ? $"{first.DeviceName} 电量 {p}%，不高于 {_threshold.Value}% 时会这样提醒你。"
+            : $"设备电量不高于 {_threshold.Value}% 时会这样提醒你。";
 
         if (_previewNotify != null)
         {

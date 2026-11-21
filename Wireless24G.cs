@@ -19,12 +19,12 @@ internal static class Wireless24G
     private const ushort VendorUsagePage = 0xFF1C;
     private const byte ReportId = 0x04;
     private const int ReportSize = 64;
-    private const int TimeoutMs = 500;
+    private const int TimeoutMs = 800;
 
     /// <summary>查询帧：固定 7 字节，其余补零。</summary>
     private static readonly byte[] QueryTail = { 0x00, 0x00, 0x1A, 0x06, 0x00, 0x00, 0x00 };
 
-    internal sealed record Reading(string Address, string Name, DeviceKind Kind, int Percent, DateTime Stamp);
+    internal sealed record Reading(string Address, string Name, DeviceKind Kind, int? Percent, DateTime? Stamp, bool Charging);
 
     [DllImport("hid.dll")] private static extern void HidD_GetHidGuid(out Guid guid);
     [DllImport("hid.dll")] private static extern bool HidD_GetPreparsedData(IntPtr h, out IntPtr data);
@@ -135,7 +135,40 @@ internal static class Wireless24G
 
     private static Reading? Query(string path)
     {
-        // 读写必须分开两个句柄：读要 overlapped（异步挂起），写不能带 overlapped
+        // 第一步只探描述符：以 **0 权限** 打开。
+        // 这里踩过大坑——早先直接对枚举到的每个 HID 都开 GENERIC_READ|GENERIC_WRITE，
+        // 连鼠标的集合也照开，结果每轮询一次鼠标就断联一下。
+        // 只读描述符和产品名用不着读写权限，0 权限的句柄就够，且不会打扰设备。
+        IntPtr probe = CreateFile(path, 0, FILE_SHARE_READ_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        if (probe == new IntPtr(-1)) return null;
+
+        HIDP_CAPS caps;
+        string product;
+        try
+        {
+            if (!HidD_GetPreparsedData(probe, out IntPtr pre)) return null;
+
+            try
+            {
+                if (HidP_GetCaps(pre, out caps) != 0x00110000) return null;
+            }
+            finally { HidD_FreePreparsedData(pre); }
+
+            if (caps.UsagePage != VendorUsagePage || caps.OutputReportByteLength != ReportSize || caps.InputReportByteLength != ReportSize)
+                return null;
+
+            var name = new StringBuilder(128);
+            HidD_GetProductString(probe, name, name.Capacity);
+            product = name.ToString().Trim();
+            if (product.Length == 0) product = "2.4G 设备";
+        }
+        finally
+        {
+            CloseHandle(probe);
+        }
+
+        // 确认是 2.4G 接收器之后，才打开真正的读写句柄。
+        // 读写必须分开两个：读要 overlapped（异步挂起），写不能带 overlapped
         // （带了标志又传 null OVERLAPPED 会直接 ERROR_INVALID_PARAMETER）
         IntPtr hRead = CreateFile(path, GENERIC_READ, FILE_SHARE_READ_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
         if (hRead == new IntPtr(-1)) return null;
@@ -147,23 +180,34 @@ internal static class Wireless24G
 
         try
         {
-            if (!HidD_GetPreparsedData(hRead, out IntPtr pre)) return null;
+            DeviceKind kind = product.Contains("Mouse", StringComparison.OrdinalIgnoreCase) ? DeviceKind.Mouse
+                : product.Contains("Keyboard", StringComparison.OrdinalIgnoreCase) ? DeviceKind.Keyboard
+                : DeviceKind.Generic;
 
-            HIDP_CAPS caps;
-            try
-            {
-                if (HidP_GetCaps(pre, out caps) != 0x00110000) return null;
-            }
-            finally { HidD_FreePreparsedData(pre); }
-            if (caps.UsagePage != VendorUsagePage || caps.OutputReportByteLength != ReportSize || caps.InputReportByteLength != ReportSize)
-                return null;
+            // 2.4G 设备没有 MAC，用设备路径的稳定片段当标识
+            string address = StableId(path);
 
-            var name = new StringBuilder(128);
-            HidD_GetProductString(hRead, name, name.Capacity);
-            string product = name.ToString().Trim();
-            if (product.Length == 0) product = "2.4G 设备";
+            // 接收器还在 = 这台设备就是走 2.4G。查询失败只意味着"这次没读到"，
+            // 不能因此判定它不存在——否则界面会退回蓝牙那条旧缓存，显示成一天前的数据。
+            (int Percent, bool Charging)? read = TryReadPercent(hRead, hWrite, ev);
+            return read is { } value
+                ? new Reading(address, product, kind, value.Percent, DateTime.Now, value.Charging)
+                : new Reading(address, product, kind, null, null, false);
+        }
+        finally
+        {
+            CloseHandle(ev);
+            CloseHandle(hRead);
+            CloseHandle(hWrite);
+        }
+    }
 
-            // 先挂一个读，再把查询帧写出去，避免漏掉很快返回的响应
+    /// <summary>发一次状态查询并解析电量与充电标志。失败重试一次，仍失败返回 null（表示"没读到"，不是"没设备"）。</summary>
+    private static (int Percent, bool Charging)? TryReadPercent(IntPtr hRead, IntPtr hWrite, IntPtr ev)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            // 先挂读再写帧，避免很快返回的响应漏掉
             byte[] inbound = new byte[ReportSize];
             ResetEvent(ev);
             var ov = new OVERLAPPED { hEvent = ev };
@@ -173,43 +217,34 @@ internal static class Wireless24G
             frame[0] = ReportId;
             Array.Copy(QueryTail, 0, frame, 1, QueryTail.Length);
 
-            bool wrote = WriteFile(hWrite, frame, frame.Length, out _, IntPtr.Zero);
-            if (!wrote)
+            if (!WriteFile(hWrite, frame, frame.Length, out _, IntPtr.Zero))
             {
                 CancelIo(hRead);
                 GetOverlappedResult(hRead, ref ov, out _, true);
-                return null;
+                continue;
             }
 
             if (WaitForSingleObject(ev, TimeoutMs) != 0)
             {
                 CancelIo(hRead);
                 GetOverlappedResult(hRead, ref ov, out _, true);
-                return null;
+                continue;
             }
 
-            if (!GetOverlappedResult(hRead, ref ov, out int n, false) || n < 10) return null;
+            if (!GetOverlappedResult(hRead, ref ov, out int n, false) || n < 10) continue;
 
             // 响应校验：reportId 0x04 + 00 00 1A 06
-            if (inbound[0] != ReportId || inbound[3] != 0x1A || inbound[4] != 0x06) return null;
+            if (inbound[0] != ReportId || inbound[3] != 0x1A || inbound[4] != 0x06) continue;
 
             int percent = inbound[8];
-            if (percent is <= 0 or > 100) return null;
-
-            DeviceKind kind = product.Contains("Mouse", StringComparison.OrdinalIgnoreCase) ? DeviceKind.Mouse
-                : product.Contains("Keyboard", StringComparison.OrdinalIgnoreCase) ? DeviceKind.Keyboard
-                : DeviceKind.Generic;
-
-            // 2.4G 设备没有 MAC，用设备路径的稳定片段当标识
-            string address = StableId(path);
-            return new Reading(address, product, kind, percent, DateTime.Now);
+            if (percent is > 0 and <= 100)
+            {
+                // 下标 9 是充电标志：非 0 = 正在充电（官方驱动同款帧布局）
+                return (percent, inbound[9] != 0);
+            }
         }
-        finally
-        {
-            CloseHandle(ev);
-            CloseHandle(hRead);
-            CloseHandle(hWrite);
-        }
+
+        return null;
     }
 
     /// <summary>设备路径里取出一段稳定标识，用于别名键和去重。</summary>
